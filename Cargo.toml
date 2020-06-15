@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 fraction = "0.6.3"
+fehler = "1.0.0"

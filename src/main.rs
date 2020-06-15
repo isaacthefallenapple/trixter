@@ -1,9 +1,12 @@
 #![allow(unused_macros, dead_code)]
+use fehler::throws;
 use std::fmt::{self, Debug, Write as FmtWrite};
 use std::io::{self, prelude::*};
 use std::ops::{Index, IndexMut};
 
 type Dec = fraction::GenericFraction<usize>;
+
+type Error = io::Error;
 
 trait ToTex {
     fn to_tex(&self, f: &mut dyn FmtWrite) -> fmt::Result;
@@ -132,7 +135,6 @@ struct Matrix<'a> {
     width: usize,
     height: usize,
     rows: Vec<Row>,
-    rowops: Vec<Rowop>,
     output: Box<dyn Write + 'a>,
 }
 
@@ -163,7 +165,8 @@ impl<'a> Matrix<'a> {
         self.rows.sort_by_key(Row::leading_zeroes)
     }
 
-    fn gauss_pass(&mut self, row: usize) -> io::Result<()> {
+    #[throws]
+    fn gauss_pass(&mut self, row: usize) {
         if let Some((lzs, lnz)) = self[row].leading_non_zero() {
             if lnz != Dec::from(1) {
                 let r = lnz.recip();
@@ -186,10 +189,10 @@ impl<'a> Matrix<'a> {
             }
             self.write_end(&ops)?;
         }
-        Ok(())
     }
 
-    fn gauss_jordan_pass(&mut self, row: usize) -> io::Result<()> {
+    #[throws]
+    fn gauss_jordan_pass(&mut self, row: usize) {
         if let Some((lzs, _)) = self[row].leading_non_zero() {
             for j in (0..row).rev() {
                 let next_row = &self[j];
@@ -200,73 +203,68 @@ impl<'a> Matrix<'a> {
                 }
             }
         }
-        Ok(())
     }
 
-    fn gauss_solve(&mut self) -> io::Result<()> {
+    #[throws]
+    fn gauss_solve(&mut self) {
         for i in 0..self.height {
             self.sort_by_leading_zeroes();
             self.gauss_pass(i)?;
         }
-        self.write_matrix(&[])
+        self.write_matrix(&[])?;
     }
 
-    fn gauss_jordan_solve(&mut self) -> io::Result<()> {
+    #[throws]
+    fn gauss_jordan_solve(&mut self) {
         self.gauss_solve()?;
         for i in (1..self.height).rev() {
             self.gauss_jordan_pass(i)?;
         }
         self.write_matrix(&[])?;
-        Ok(())
     }
 
     fn set_output(&mut self, w: impl Write + 'a) {
         self.output = Box::new(w);
     }
+}
 
-    fn write_begin(&mut self) -> io::Result<()> {
+// Implementation of formatting methods.
+impl Matrix<'_> {
+    #[throws]
+    fn write_begin(&mut self) {
         writeln!(self.output, r"\begin{{gmatrix}}[p]")?;
-        self.write_rows()
+        self.write_rows()?;
     }
 
-    fn write_end(&mut self, ops: &[Rowop]) -> io::Result<()> {
+    #[throws]
+    fn write_end(&mut self, ops: &[Rowop]) {
         if !ops.is_empty() {
             self.write_rowops(ops)?;
         }
-        writeln!(self, r"\end{{gmatrix}} \\")
+        writeln!(self, r"\end{{gmatrix}} \\")?;
     }
 
-    fn write_rows(&mut self) -> io::Result<()> {
+    #[throws]
+    fn write_rows(&mut self) {
         let upto = self.height - 1;
         for row in &self.rows[..upto] {
             writeln!(self.output, r"  {} \\", row.to_tex_str())?;
         }
-        writeln!(self, "  {}", self.rows[upto].to_tex_str())
+        writeln!(self, "  {}", self.rows[upto].to_tex_str())?;
     }
 
-    fn write_rowops(&mut self, ops: &[Rowop]) -> io::Result<()> {
+    #[throws]
+    fn write_rowops(&mut self, ops: &[Rowop]) {
         writeln!(self, r"  \rowops")?;
         for op in ops {
             writeln!(self, "  {}", op.to_tex_str())?;
         }
-        Ok(())
     }
 
-    fn write_matrix(&mut self, ops: &[Rowop]) -> io::Result<()> {
+    #[throws]
+    fn write_matrix(&mut self, ops: &[Rowop]) {
         self.write_begin()?;
-        self.write_end(ops)
-    }
-
-    fn to_tex_lines(&self) -> Vec<String> {
-        let mut lines = Vec::with_capacity(self.height + 3);
-        lines.push(r"\begin{gmatrix}[p]".into());
-        let upto = self.height - 1;
-        for row in &self.rows[..upto] {
-            lines.push(format!(r"  {:#?} \\", row));
-        }
-        lines.push(format!("  {:#?}", self.rows[upto]));
-        lines.push(r"  \rowops".into());
-        lines
+        self.write_end(ops)?;
     }
 }
 
@@ -290,15 +288,6 @@ impl<'a> PartialEq for Matrix<'a> {
     }
 }
 
-impl<'a> ToTex for Matrix<'a> {
-    fn to_tex(&self, w: &mut dyn FmtWrite) -> fmt::Result {
-        for line in &self.to_tex_lines() {
-            writeln!(w, "{}", line)?;
-        }
-        Ok(())
-    }
-}
-
 impl<'a> Write for Matrix<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.output.write(buf)
@@ -308,22 +297,16 @@ impl<'a> Write for Matrix<'a> {
     }
 }
 
-impl<'a> Debug for Matrix<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if f.alternate() {
-            self.to_tex(f)
-        } else {
-            for row in &self.rows {
-                writeln!(
-                    f,
-                    "{}",
-                    row.iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                )?;
-            }
-            Ok(())
+impl Debug for Matrix<'_> {
+    #[throws(fmt::Error)]
+    fn fmt(&self, f: &mut fmt::Formatter) {
+        for row in &self.rows {
+            f.write_str(
+                &row.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("  "),
+            )?;
         }
     }
 }
@@ -350,11 +333,13 @@ macro_rules! matrix {
                 width: width.unwrap(),
                 height: rows.len(),
                 rows,
-                rowops: Vec::new(),
                 output: Box::new(std::io::sink()),
             }
         }
     };
+    // ($($($x:expr),+ ;; ($y:expr),+);+) => {
+
+    // }
 }
 
 #[cfg(test)]
