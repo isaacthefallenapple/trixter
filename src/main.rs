@@ -2,7 +2,9 @@
 use fehler::throws;
 use std::fmt::{self, Debug, Write as FmtWrite};
 use std::io::{self, prelude::*};
-use std::ops::{Index, IndexMut};
+use std::ops::{Deref, Index, IndexMut};
+
+const TAB: &'static str = "    ";
 
 type Dec = fraction::GenericFraction<usize>;
 
@@ -90,6 +92,14 @@ impl Row {
     }
 }
 
+impl Deref for Row {
+    type Target = [Dec];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl Debug for Row {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if f.alternate() {
@@ -100,15 +110,15 @@ impl Debug for Row {
     }
 }
 
-impl Index<usize> for Row {
-    type Output = Dec;
+impl<Idx: std::slice::SliceIndex<[Dec]>> Index<Idx> for Row {
+    type Output = Idx::Output;
 
-    fn index(&self, index: usize) -> &Self::Output {
+    fn index(&self, index: Idx) -> &Self::Output {
         self.0.index(index)
     }
 }
 
-impl ToTex for Row {
+impl ToTex for [Dec] {
     fn to_tex(&self, w: &mut dyn FmtWrite) -> fmt::Result {
         write!(
             w,
@@ -131,14 +141,33 @@ fn main() {
     println!("Hello, world!");
 }
 
-struct Matrix<'a> {
+struct Matrix<W: Write> {
     width: usize,
     height: usize,
     rows: Vec<Row>,
-    output: Box<dyn Write + 'a>,
+    rhs: usize,
+    output: W,
 }
 
-impl<'a> Matrix<'a> {
+impl<W: Write> Matrix<W> {
+    fn new(rows: Vec<Row>, rhs: usize, output: W) -> Self {
+        let height = rows.len();
+        let width = rows[0].len();
+
+        assert!(
+            rows.iter().all(|r| r.len() == width),
+            "All rows need to have the same length."
+        );
+
+        Self {
+            width,
+            height,
+            rows,
+            rhs,
+            output,
+        }
+    }
+
     fn swap(&mut self, i: usize, j: usize) {
         self.rows.swap(i, j);
     }
@@ -223,17 +252,32 @@ impl<'a> Matrix<'a> {
         self.write_matrix(&[])?;
     }
 
-    fn set_output(&mut self, w: impl Write + 'a) {
-        self.output = Box::new(w);
+    fn transform_output<V: Write>(self, output: V) -> Matrix<V> {
+        Matrix {
+            width: self.width,
+            height: self.height,
+            rows: self.rows,
+            rhs: self.rhs,
+            output,
+        }
+    }
+
+    fn into_output(self) -> W {
+        self.output
     }
 }
 
 // Implementation of formatting methods.
-impl Matrix<'_> {
+impl<W: Write> Matrix<W> {
     #[throws]
     fn write_begin(&mut self) {
-        writeln!(self.output, r"\begin{{gmatrix}}[p]")?;
-        self.write_rows()?;
+        if self.rhs == 0 {
+            writeln!(self, r"\begin{{gmatrix}}[p]")?;
+            self.write_rows()?;
+        } else {
+            self.write_lhs()?;
+            self.write_begin_rhs()?;
+        }
     }
 
     #[throws]
@@ -248,16 +292,16 @@ impl Matrix<'_> {
     fn write_rows(&mut self) {
         let upto = self.height - 1;
         for row in &self.rows[..upto] {
-            writeln!(self.output, r"  {} \\", row.to_tex_str())?;
+            writeln!(self.output, r"{tab}{} \\", row.to_tex_str(), tab = TAB)?;
         }
-        writeln!(self, "  {}", self.rows[upto].to_tex_str())?;
+        writeln!(self, "{tab}{}", self.rows[upto].to_tex_str(), tab = TAB)?;
     }
 
     #[throws]
     fn write_rowops(&mut self, ops: &[Rowop]) {
-        writeln!(self, r"  \rowops")?;
+        writeln!(self, r"{tab}\rowops", tab = TAB)?;
         for op in ops {
-            writeln!(self, "  {}", op.to_tex_str())?;
+            writeln!(self, "{tab}{}", op.to_tex_str(), tab = TAB)?;
         }
     }
 
@@ -266,9 +310,53 @@ impl Matrix<'_> {
         self.write_begin()?;
         self.write_end(ops)?;
     }
+
+    // Formatting methods for bisected matrix.
+    #[throws]
+    fn write_lhs(&mut self) {
+        writeln!(self, r"\left.\begin{{gmatrix}}[L]")?;
+        self.write_rows_lhs()?;
+        writeln!(self, r"\end{{gmatrix}}\right|\;")?;
+    }
+
+    #[throws]
+    fn write_rows_lhs(&mut self) {
+        let rhs = self.rhs;
+        let mut iter = self.rows.iter().map(|row| &row[..rhs]);
+        for row in iter.by_ref().take(self.height - 1) {
+            writeln!(self.output, r"{tab}{} \\", row.to_tex_str(), tab = TAB)?;
+        }
+        writeln!(
+            self.output,
+            r"{tab}{}",
+            iter.next().unwrap().to_tex_str(),
+            tab = TAB
+        )?;
+    }
+
+    #[throws]
+    fn write_begin_rhs(&mut self) {
+        writeln!(self, r"\begin{{gmatrix}}[R]")?;
+        self.write_rows_rhs()?;
+    }
+
+    #[throws]
+    fn write_rows_rhs(&mut self) {
+        let rhs = self.rhs;
+        let mut iter = self.rows.iter().map(|row| &row[rhs..]);
+        for row in iter.by_ref().take(self.height - 1) {
+            writeln!(self.output, r"{tab}{} \\", row.to_tex_str(), tab = TAB)?;
+        }
+        writeln!(
+            self.output,
+            r"{tab}{}",
+            iter.next().unwrap().to_tex_str(),
+            tab = TAB
+        )?;
+    }
 }
 
-impl<'a> Index<usize> for Matrix<'a> {
+impl<W: Write> Index<usize> for Matrix<W> {
     type Output = Row;
 
     fn index(&self, idx: usize) -> &Self::Output {
@@ -276,19 +364,19 @@ impl<'a> Index<usize> for Matrix<'a> {
     }
 }
 
-impl<'a> IndexMut<usize> for Matrix<'a> {
+impl<W: Write> IndexMut<usize> for Matrix<W> {
     fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
         &mut self.rows[idx]
     }
 }
 
-impl<'a> PartialEq for Matrix<'a> {
-    fn eq(&self, other: &Matrix) -> bool {
+impl<W: Write> PartialEq for Matrix<W> {
+    fn eq(&self, other: &Matrix<W>) -> bool {
         self.width == other.width && self.height == other.height && self.rows == other.rows
     }
 }
 
-impl<'a> Write for Matrix<'a> {
+impl<W: Write> Write for Matrix<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.output.write(buf)
     }
@@ -297,7 +385,7 @@ impl<'a> Write for Matrix<'a> {
     }
 }
 
-impl Debug for Matrix<'_> {
+impl<W: Write> Debug for Matrix<W> {
     #[throws(fmt::Error)]
     fn fmt(&self, f: &mut fmt::Formatter) {
         for row in &self.rows {
@@ -333,8 +421,25 @@ macro_rules! matrix {
                 width: width.unwrap(),
                 height: rows.len(),
                 rows,
-                output: Box::new(std::io::sink()),
+                rhs: 0,
+                output: std::io::sink(),
             }
+        }
+    };
+    // ($($($x:expr),+ ;; ($y:expr),+);+) => {
+
+    // }
+}
+
+macro_rules! rows {
+    ($($($x:expr),+);+) => {
+        {
+            vec![$(Row::from(vec![$(Dec::from($x)),+])),+]
+        }
+    };
+    ($($($x:expr),+);+;) => {
+        {
+            rows!($($($x),+);+)
         }
     };
     // ($($($x:expr),+ ;; ($y:expr),+);+) => {
@@ -530,17 +635,55 @@ mod tests {
     #[test]
     fn test_output() -> std::io::Result<()> {
         let f = std::fs::File::create("./output.txt")?;
-        let mut m = matrix! {
+        let m = matrix! {
             2, 0, 3;
             1, -2, 3;
             0, 1, -2;
             2, 1, 1
         };
 
-        m.set_output(f);
+        let mut m = m.transform_output(f);
 
         m.gauss_solve();
 
         Ok(())
+    }
+
+    #[test]
+    fn test_bisected_matrix() {
+        let m = matrix! {
+            1, 2, 3;
+            2, 3, 4;
+            1, 2, 3
+        };
+
+        let mut m = m.transform_output(io::stdout());
+        m.rhs = 2;
+        m.gauss_pass(0);
+    }
+
+    #[test]
+    fn test_rows_macro() {
+        let rows: Vec<Row> = rows! {
+            1,2,3;
+            2,3,4;
+            3,4,5
+        };
+
+        let rows2: Vec<Row> = rows! {
+            1,2,3;
+            2,3,4;
+            3,4,5;
+        };
+
+        assert_eq!(
+            rows,
+            vec![
+                Row::from(vec![1.into(), 2.into(), 3.into()]),
+                Row::from(vec![2.into(), 3.into(), 4.into()]),
+                Row::from(vec![3.into(), 4.into(), 5.into()]),
+            ]
+        );
+        assert_eq!(rows, rows2);
     }
 }
